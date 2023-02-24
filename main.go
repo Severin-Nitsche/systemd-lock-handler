@@ -10,7 +10,7 @@ import (
 	"github.com/coreos/go-systemd/v22/daemon"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/coreos/go-systemd/v22/login1"
-	"github.com/godbus/dbus/v5"
+	dbus "github.com/godbus/dbus/v5"
 )
 
 // Starts a systemd unit and blocks until the job is completed.
