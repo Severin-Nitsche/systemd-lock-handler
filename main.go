@@ -22,7 +22,7 @@ func StartSystemdUserUnit(unitName string) error {
 
 	ch := make(chan string, 1)
 
-	_, err = conn.StartUnitContext(context.Background(), unitName, "replace", nil)
+	_, err = conn.StartUnitContext(context.Background(), unitName, "replace", ch)
 	if err != nil {
 		return fmt.Errorf("failed to start unit: %v", err)
 	}
