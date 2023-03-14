@@ -76,7 +76,9 @@ func ListenForSleep() {
 				log.Println("Error starting sleep.target:", err)
 			}
 			// Uninhibit sleeping. I.e.: let the system actually go to sleep.
-			lock.Close()
+			if err := lock.Close(); err != nil {
+				log.Fatalln("Error releasing lock inhibitor:", err)
+			}
 		}
 	}()
 
