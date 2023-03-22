@@ -69,21 +69,49 @@ func ListenForSleep() {
 			}
 			log.Println("Got lock on sleep inhibitor")
 
-			<-c
-			log.Println("The system is going to sleep")
+			if err := waitPrepareForSleep(c, true); err != nil {
+				log.Fatalln("Before releasing inhibitor lock:", err)
+			}
+
+			log.Println("Starting sleep.target")
 
 			if err = StartSystemdUserUnit("sleep.target"); err != nil {
 				log.Println("Error starting sleep.target:", err)
 			}
 			// Uninhibit sleeping. I.e.: let the system actually go to sleep.
 			if err := lock.Close(); err != nil {
-				log.Fatalln("Error releasing lock inhibitor:", err)
+				log.Fatalln("Error releasing inhibitor lock:", err)
 			}
+
+			if err := waitPrepareForSleep(c, false); err != nil {
+				log.Fatalln("After releasing inhibitor lock:", err)
+			}
+
+			log.Println("Started sleep.target, the system is going to sleep")
 		}
 	}()
 
 	conn.Signal(c)
 	log.Println("Listening for sleep events...")
+}
+
+func waitPrepareForSleep(c <-chan *dbus.Signal, want bool) error {
+	s := <-c
+
+	if len(s.Body) == 0 {
+		return fmt.Errorf("empty signal arguments: %v", s)
+	}
+
+	got, ok := s.Body[0].(bool)
+	if !ok {
+		return fmt.Errorf("active argument not a bool: %v", s.Body[0])
+	}
+
+	if want != got {
+		return fmt.Errorf("expected PrepareForSleep(%v), got %v", want, got)
+	}
+
+	return nil
 }
 
 func ListenForLock(user *user.User) {
