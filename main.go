@@ -13,8 +13,8 @@ import (
 	dbus "github.com/godbus/dbus/v5"
 )
 
-// Starts a systemd unit and blocks until the job is completed.
-func StartSystemdUserUnit(unitName string) error {
+// Starts/Stops a systemd unit and blocks until the job is completed.
+func HandleSystemdUserUnit(unitName string, start bool) error {
 	conn, err := systemd.NewUserConnectionContext(context.Background())
 	if err != nil {
 		return fmt.Errorf("failed to connect to systemd user session: %v", err)
@@ -22,14 +22,18 @@ func StartSystemdUserUnit(unitName string) error {
 
 	ch := make(chan string, 1)
 
-	_, err = conn.StartUnitContext(context.Background(), unitName, "replace", ch)
+	if start {
+		_, err = conn.StartUnitContext(context.Background(), unitName, "replace", ch)
+	} else {
+		_, err = conn.StopUnitContext(context.Background(), unitName, "replace", ch)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to start unit: %v", err)
 	}
 
 	result := <-ch
 	if result == "done" {
-		log.Println("Started systemd unit:", unitName)
+		log.Printf("Handled systemd unit: %v (start: %v)", unitName, start)
 	} else {
 		return fmt.Errorf("failed to start unit %v: %v", unitName, result)
 	}
@@ -43,8 +47,6 @@ func ListenForSleep() {
 		log.Fatalln("Could not connect to the system D-Bus", err)
 	}
 
-	// TODO: Should I also stop `sleep.target` after the system comes back
-	// from sleeping? (`lock.target` will continue running anyway).
 	err = conn.AddMatchSignal(
 		dbus.WithMatchObjectPath("/org/freedesktop/login1"),
 		dbus.WithMatchInterface("org.freedesktop.login1.Manager"),
@@ -75,9 +77,12 @@ func ListenForSleep() {
 
 			log.Println("Starting sleep.target")
 
-			if err = StartSystemdUserUnit("sleep.target"); err != nil {
+			if err = HandleSystemdUserUnit("sleep.target", true); err != nil {
 				log.Println("Error starting sleep.target:", err)
 			}
+
+			log.Println("Started sleep.target, the system is going to sleep")
+
 			// Uninhibit sleeping. I.e.: let the system actually go to sleep.
 			if err := lock.Close(); err != nil {
 				log.Fatalln("Error releasing inhibitor lock:", err)
@@ -87,7 +92,10 @@ func ListenForSleep() {
 				log.Fatalln("After releasing inhibitor lock:", err)
 			}
 
-			log.Println("Started sleep.target, the system is going to sleep")
+			if err = HandleSystemdUserUnit("sleep.target", false); err != nil {
+				log.Println("Error stopping sleep.target:", err)
+			}
+
 		}
 	}()
 
@@ -169,7 +177,7 @@ func ListenForLock(user *user.User) {
 			}
 			log.Println("Session signal for current user:", signalName)
 
-			if err = StartSystemdUserUnit(target); err != nil {
+			if err = HandleSystemdUserUnit(target, true); err != nil {
 				log.Println("Error starting target:", target, err)
 			}
 		}
