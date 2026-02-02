@@ -1,213 +1,275 @@
 package main
 
 import (
-	"context"
-	"fmt"
-	"log"
-	"os/user"
-	"strings"
+  "context"
+  "fmt"
+  "log"
+  "os/user"
+  "os"
 
-	"github.com/coreos/go-systemd/v22/daemon"
-	systemd "github.com/coreos/go-systemd/v22/dbus"
-	"github.com/coreos/go-systemd/v22/login1"
-	dbus "github.com/godbus/dbus/v5"
+  "github.com/coreos/go-systemd/v22/daemon"
+  systemd "github.com/coreos/go-systemd/v22/dbus"
+  "github.com/coreos/go-systemd/v22/login1"
+  dbus "github.com/godbus/dbus/v5"
 )
 
 // Starts/Stops a systemd unit and blocks until the job is completed.
-func HandleSystemdUserUnit(unitName string, start bool) error {
-	conn, err := systemd.NewUserConnectionContext(context.Background())
-	if err != nil {
-		return fmt.Errorf("failed to connect to systemd user session: %v", err)
-	}
+func HandleSystemdUnit(unitName string, start bool, system bool) error {
+  var conn *systemd.Conn
+  var err error
 
-	ch := make(chan string, 1)
+  if system {
+    conn, err = systemd.NewSystemConnectionContext(context.Background())
+  } else {
+    conn, err = systemd.NewUserConnectionContext(context.Background())
+  }
 
-	if start {
-		_, err = conn.StartUnitContext(context.Background(), unitName, "replace", ch)
-	} else {
-		_, err = conn.StopUnitContext(context.Background(), unitName, "replace", ch)
-	}
-	if err != nil {
-		return fmt.Errorf("failed to start unit: %v", err)
-	}
+  if err != nil {
+    return fmt.Errorf("failed to connect to systemd session (system: %v): %v", system, err)
+  }
 
-	result := <-ch
-	if result == "done" {
-		log.Printf("Handled systemd unit: %v (start: %v)", unitName, start)
-	} else {
-		return fmt.Errorf("failed to start unit %v: %v", unitName, result)
-	}
+  ch := make(chan string, 1)
 
-	return nil
+  if start {
+    _, err = conn.StartUnitContext(context.Background(), unitName, "replace", ch)
+  } else {
+    _, err = conn.StopUnitContext(context.Background(), unitName, "replace", ch)
+  }
+  if err != nil {
+    return fmt.Errorf("failed to handle unit (start: %v): %v", start, err)
+  }
+
+  result := <-ch
+  if result == "done" {
+    log.Printf("Handled systemd unit: %v (system: %v, start: %v)", unitName, system, start)
+  } else {
+    return fmt.Errorf("failed to handle unit %v (system: %v, start: %v): %v", unitName, system, start, result)
+  }
+
+  return nil
 }
 
-func ListenForSleep() {
-	conn, err := dbus.ConnectSystemBus()
-	if err != nil {
-		log.Fatalln("Could not connect to the system D-Bus", err)
-	}
+func hardcodeSleep() (
+  func(), 
+  func(*dbus.Conn, *dbus.Signal) bool, 
+  func(), 
+  func(),
+) {
+  var logind *login1.Conn
+  var lock *os.File
+  want := true
 
-	err = conn.AddMatchSignal(
-		dbus.WithMatchObjectPath("/org/freedesktop/login1"),
-		dbus.WithMatchInterface("org.freedesktop.login1.Manager"),
-		dbus.WithMatchMember("PrepareForSleep"),
-	)
-	if err != nil {
-		log.Fatalln("Failed to listen for sleep signals", err)
-	}
+  initLogind := func () {
+    var err error
+    logind, err = login1.New()
+    if err != nil {
+      log.Fatalln("Failed to connect to logind")
+    }
+  }
 
-	c := make(chan *dbus.Signal, 10)
-	logind, err := login1.New()
-	if err != nil {
-		log.Fatalln("Failed to connect to logind")
-	}
+  inhibitSleep := func () {
+    var err error
+    lock, err = logind.Inhibit(
+      "sleep",
+      "systemd-lock-handler",
+      "Start pre-sleep target",
+      "delay",
+    )
+    if err != nil {
+      log.Fatalln("Failed to grab sleep inhibitor lock", err)
+    }
+    log.Println("Got lock on sleep inhibitor")
+  }
 
-	go func() {
-		for {
-			// We need to inhibit sleeping so we have time to execute our actions before the system sleeps.
-			lock, err := logind.Inhibit("sleep", "systemd-lock-handler", "Start pre-sleep target", "delay")
-			if err != nil {
-				log.Fatalln("Failed to grab sleep inhibitor lock", err)
-			}
-			log.Println("Got lock on sleep inhibitor")
+  uninhibitSleep := func () {
+    err := lock.Close()
+    if err != nil {
+      log.Fatalln("Error releasing inhibitor lock:", err)
+    }
+  }
 
-			if err := waitPrepareForSleep(c, true); err != nil {
-				log.Fatalln("Before releasing inhibitor lock:", err)
-			}
+  verify := func (conn *dbus.Conn, v *dbus.Signal) bool {
+    if len(v.Body) == 0 {
+      log.Fatalln("empty signal arguments:", v)
+    }
 
-			log.Println("Starting sleep.target")
+    got, ok := v.Body[0].(bool)
+    if !ok {
+      log.Fatalln("active argument not a bool:", v.Body[0])
+    }
 
-			if err = HandleSystemdUserUnit("sleep.target", true); err != nil {
-				log.Println("Error starting sleep.target:", err)
-			}
+    if want != got {
+      log.Fatalf("expected PrepareForSleep(%v), got %v", want, got)
+    }
 
-			log.Println("Started sleep.target, the system is going to sleep")
+    want = !want
 
-			// Uninhibit sleeping. I.e.: let the system actually go to sleep.
-			if err := lock.Close(); err != nil {
-				log.Fatalln("Error releasing inhibitor lock:", err)
-			}
+    return true
+  }
 
-			if err := waitPrepareForSleep(c, false); err != nil {
-				log.Fatalln("After releasing inhibitor lock:", err)
-			}
-
-			if err = HandleSystemdUserUnit("sleep.target", false); err != nil {
-				log.Println("Error stopping sleep.target:", err)
-			}
-
-		}
-	}()
-
-	conn.Signal(c)
-	log.Println("Listening for sleep events...")
+  return initLogind, verify, inhibitSleep, uninhibitSleep
 }
 
-func waitPrepareForSleep(c <-chan *dbus.Signal, want bool) error {
-	s := <-c
+func hardcodeLock(user *user.User) (
+  func(), 
+  func(*dbus.Conn, *dbus.Signal) bool, 
+  func(), 
+  func(),
+) {
+  verifySession := func (conn *dbus.Conn, v *dbus.Signal) bool {
+    // Get the (un)locked session
+    obj := conn.Object("org.freedesktop.login1", v.Path)
 
-	if len(s.Body) == 0 {
-		return fmt.Errorf("empty signal arguments: %v", s)
-	}
+    name, err := obj.GetProperty("org.freedesktop.login1.Session.Name")
+    if err != nil {
+      log.Println("WARNING: Could not obtain details for session:", err)
+      return false
+    }
 
-	got, ok := s.Body[0].(bool)
-	if !ok {
-		return fmt.Errorf("active argument not a bool: %v", s.Body[0])
-	}
+    if name.Value() != user.Username {
+      return false
+    }
+    log.Println("Session signal for current user:", v.Name)
 
-	if want != got {
-		return fmt.Errorf("expected PrepareForSleep(%v), got %v", want, got)
-	}
+    return true
+  }
 
-	return nil
+  noop := func () {}
+
+  return noop, verifySession, noop, noop
 }
 
-func ListenForLock(user *user.User) {
-	conn, err := dbus.ConnectSystemBus()
-	if err != nil {
-		log.Fatalln("Could not connect to the system D-Bus", err)
-	}
 
-	err = conn.AddMatchSignal(
-		dbus.WithMatchInterface("org.freedesktop.login1.Session"),
-		dbus.WithMatchSender("org.freedesktop.login1"),
-		dbus.WithMatchMember("Lock"),
-	)
-	if err != nil {
-		log.Fatalln("Failed to listen for lock signals", err)
-	}
+func ListenFor(
+  target string, 
+  toggle bool, 
+  start bool, 
+  system bool, 
+  hardcode func() (
+    func(), 
+    func(*dbus.Conn, *dbus.Signal) bool, 
+    func(), 
+    func(),
+  ), 
+  options ...dbus.MatchOption,
+) {
+  conn, err := dbus.ConnectSystemBus()
+  if err != nil {
+    log.Fatalln("Could not connect to the system D-Bus", err)
+  }
 
-	err = conn.AddMatchSignal(
-		dbus.WithMatchInterface("org.freedesktop.login1.Session"),
-		dbus.WithMatchSender("org.freedesktop.login1"),
-		dbus.WithMatchMember("Unlock"),
-	)
-	if err != nil {
-		log.Fatalln("Failed to listen for unlock signals", err)
-	}
+  err = conn.AddMatchSignal(options...)
+  if err != nil {
+    log.Fatalf("Failed to listen for %v signals: %v", target, err)
+  }
 
-	c := make(chan *dbus.Signal, 10)
-	go func() {
-		for {
-			v := <-c
+  init, verify, before, after := hardcode();
 
-			var target string
-			signalName := v.Name
-			if strings.HasSuffix(signalName, "Lock") {
-				target = "lock.target"
-			} else if strings.HasSuffix(signalName, "Unlock") {
-				target = "unlock.target"
-			} else {
-				log.Println("Got an unknown event!", v)
-				continue
-			}
+  c := make(chan *dbus.Signal, 10)
 
-			// Get the (un)locked session...
-			obj := conn.Object("org.freedesktop.login1", v.Path)
+  // Hardcode: Initialize logind for sleep.target
+  init()
 
-			name, err := obj.GetProperty("org.freedesktop.login1.Session.Name")
-			if err != nil {
-				log.Println("WARNING: Could not obtain details for locked session:", err)
-				continue
-			}
+  waitFor := func (start bool) {
+    v := <-c
 
-			// ... And check that it belongs to the current user:
-			if name.Value() != user.Username {
-				continue
-			}
-			log.Println("Session signal for current user:", signalName)
+    // Hardcode: verify user session for (un)lock.target
+    // Hardcode: verify want==got for sleep.target
+    if !verify(conn, v) {
+      return
+    }
 
-			if err = HandleSystemdUserUnit(target, true); err != nil {
-				log.Println("Error starting target:", target, err)
-			}
-		}
-	}()
+    err = HandleSystemdUnit(target, start, system)
+    if err != nil {
+      log.Println("Error handling target:", target, err)
+    }
+  }
 
-	conn.Signal(c)
-	log.Println("Listening for lock events...")
+  go func() {
+    for {
+      // Hardcode: Inhibit Sleep for sleep.target
+      before()
+
+      waitFor(start)
+
+      if !toggle {
+	continue
+      }
+
+      // Hardcode: Uninhibit Sleep for sleep.target
+      after()
+
+      waitFor(!start)
+
+    }
+  }()
+
+  conn.Signal(c)
+  log.Printf("Listening for %v signals", target);
 }
 
 func main() {
-	log.SetFlags(log.Lshortfile)
+  log.SetFlags(log.Lshortfile)
 
-	user, err := user.Current()
-	if err != nil {
-		log.Fatalln("Failed to get username:", err)
-	}
-	log.Println("Running for user:", user.Username)
+  user, err := user.Current()
+  if err != nil {
+    log.Fatalln("Failed to get username:", err)
+  }
+  log.Println("Running for user:", user.Username)
 
-	ListenForSleep()
-	ListenForLock(user)
+  lockCode := func () (
+    func(), 
+    func(*dbus.Conn, *dbus.Signal) bool, 
+    func(), 
+    func(),
+  ){
+    return hardcodeLock(user)
+  }
 
-	log.Println("Initialization complete.")
+  // Listen for sleep
+  ListenFor(
+    "sleep.target", // target
+    true, // toggle
+    true, // start
+    false, // system
+    hardcodeSleep,
+    dbus.WithMatchObjectPath("/org/freedesktop/login1"),
+    dbus.WithMatchInterface("org.freedesktop.login1.Manager"),
+    dbus.WithMatchMember("PrepareForSleep"),
+  )
 
-	sent, err := daemon.SdNotify(true, daemon.SdNotifyReady)
-	if !sent {
-		log.Println("Couldn't call sd_notify. Not running via systemd?")
-	}
-	if err != nil {
-		log.Println("Call to sd_notify failed:", err)
-	}
+  // Listen for Lock
+  ListenFor(
+    "lock.target",
+    false, // toggle
+    true, // start
+    false, // system
+    lockCode,
+    dbus.WithMatchInterface("org.freedesktop.login1.Session"),
+    dbus.WithMatchSender("org.freedesktop.login1"),
+    dbus.WithMatchMember("Lock"),
+  )
 
-	select {}
+  ListenFor(
+    "unlock.target",
+    false, // toggle
+    true, // start
+    false, // system
+    lockCode,
+    dbus.WithMatchInterface("org.freedesktop.login1.Session"),
+    dbus.WithMatchSender("org.freedesktop.login1"),
+    dbus.WithMatchMember("Unlock"),
+  )
+  
+  log.Println("Initialization complete.")
+
+  sent, err := daemon.SdNotify(true, daemon.SdNotifyReady)
+  if !sent {
+    log.Println("Couldn't call sd_notify. Not running via systemd?")
+  }
+  if err != nil {
+    log.Println("Call to sd_notify failed:", err)
+  }
+
+  select {}
 }
