@@ -1,0 +1,13 @@
+[Unit]
+Description=Logind event to systemd target translation
+Documentation=https://github.com/Severin-Nitsche/dbus-systemd-dispatcher
+
+[Service]
+Slice=session.slice
+ExecStart=/usr/lib/dbus-systemd-dispatcher
+Type=notify
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=default.target

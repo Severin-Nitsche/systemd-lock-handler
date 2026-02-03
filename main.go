@@ -4,13 +4,13 @@ import (
   "context"
   "fmt"
   "log"
-  "os/user"
-  "os"
+  "plugin"
 
   "github.com/coreos/go-systemd/v22/daemon"
   systemd "github.com/coreos/go-systemd/v22/dbus"
-  "github.com/coreos/go-systemd/v22/login1"
   dbus "github.com/godbus/dbus/v5"
+
+  "github.com/ilyakaznacheev/cleanenv"
 )
 
 // Starts/Stops a systemd unit and blocks until the job is completed.
@@ -49,108 +49,19 @@ func HandleSystemdUnit(unitName string, start bool, system bool) error {
   return nil
 }
 
-func hardcodeSleep() (
+type Hardcode = func() (
   func(), 
   func(*dbus.Conn, *dbus.Signal) bool, 
   func(), 
   func(),
-) {
-  var logind *login1.Conn
-  var lock *os.File
-  want := true
-
-  initLogind := func () {
-    var err error
-    logind, err = login1.New()
-    if err != nil {
-      log.Fatalln("Failed to connect to logind")
-    }
-  }
-
-  inhibitSleep := func () {
-    var err error
-    lock, err = logind.Inhibit(
-      "sleep",
-      "systemd-lock-handler",
-      "Start pre-sleep target",
-      "delay",
-    )
-    if err != nil {
-      log.Fatalln("Failed to grab sleep inhibitor lock", err)
-    }
-    log.Println("Got lock on sleep inhibitor")
-  }
-
-  uninhibitSleep := func () {
-    err := lock.Close()
-    if err != nil {
-      log.Fatalln("Error releasing inhibitor lock:", err)
-    }
-  }
-
-  verify := func (conn *dbus.Conn, v *dbus.Signal) bool {
-    if len(v.Body) == 0 {
-      log.Fatalln("empty signal arguments:", v)
-    }
-
-    got, ok := v.Body[0].(bool)
-    if !ok {
-      log.Fatalln("active argument not a bool:", v.Body[0])
-    }
-
-    if want != got {
-      log.Fatalf("expected PrepareForSleep(%v), got %v", want, got)
-    }
-
-    want = !want
-
-    return true
-  }
-
-  return initLogind, verify, inhibitSleep, uninhibitSleep
-}
-
-func hardcodeLock(user *user.User) (
-  func(), 
-  func(*dbus.Conn, *dbus.Signal) bool, 
-  func(), 
-  func(),
-) {
-  verifySession := func (conn *dbus.Conn, v *dbus.Signal) bool {
-    // Get the (un)locked session
-    obj := conn.Object("org.freedesktop.login1", v.Path)
-
-    name, err := obj.GetProperty("org.freedesktop.login1.Session.Name")
-    if err != nil {
-      log.Println("WARNING: Could not obtain details for session:", err)
-      return false
-    }
-
-    if name.Value() != user.Username {
-      return false
-    }
-    log.Println("Session signal for current user:", v.Name)
-
-    return true
-  }
-
-  noop := func () {}
-
-  return noop, verifySession, noop, noop
-}
-
+)
 
 func ListenFor(
   target string, 
   toggle bool, 
   start bool, 
   system bool, 
-  hardcode func() (
-    func(), 
-    func(*dbus.Conn, *dbus.Signal) bool, 
-    func(), 
-    func(),
-  ), 
+  hardcode Hardcode, 
   options ...dbus.MatchOption,
 ) {
   conn, err := dbus.ConnectSystemBus()
@@ -170,13 +81,16 @@ func ListenFor(
   // Hardcode: Initialize logind for sleep.target
   init()
 
-  waitFor := func (start bool) {
-    v := <-c
 
-    // Hardcode: verify user session for (un)lock.target
-    // Hardcode: verify want==got for sleep.target
-    if !verify(conn, v) {
-      return
+  waitFor := func (start bool) {
+    for {
+      v := <-c
+
+      // Hardcode: verify user session for (un)lock.target
+      // Hardcode: verify want==got for sleep.target
+      if verify(conn, v) {
+	break
+      }
     }
 
     err = HandleSystemdUnit(target, start, system)
@@ -193,7 +107,7 @@ func ListenFor(
       waitFor(start)
 
       if !toggle {
-	continue
+        continue
       }
 
       // Hardcode: Uninhibit Sleep for sleep.target
@@ -208,59 +122,60 @@ func ListenFor(
   log.Printf("Listening for %v signals", target);
 }
 
+type Config struct {
+  Targets [] struct {
+    Target string `yaml:"target"`
+    Dlib string `yaml:"dlib"`
+    Toggle bool `yaml:"toggle"`
+    Start bool `yaml:"start"`
+    System bool `yaml:"system"`
+    MatchOptions map[string]string `yaml:"dbus"`
+  } `yaml:"targets"`
+}
+
 func main() {
   log.SetFlags(log.Lshortfile)
 
-  user, err := user.Current()
+  var cfg Config
+  err := cleanenv.ReadConfig("config.yml", &cfg)
   if err != nil {
-    log.Fatalln("Failed to get username:", err)
-  }
-  log.Println("Running for user:", user.Username)
-
-  lockCode := func () (
-    func(), 
-    func(*dbus.Conn, *dbus.Signal) bool, 
-    func(), 
-    func(),
-  ){
-    return hardcodeLock(user)
+    log.Fatalln("Failed to read config:", err)
   }
 
-  // Listen for sleep
-  ListenFor(
-    "sleep.target", // target
-    true, // toggle
-    true, // start
-    false, // system
-    hardcodeSleep,
-    dbus.WithMatchObjectPath("/org/freedesktop/login1"),
-    dbus.WithMatchInterface("org.freedesktop.login1.Manager"),
-    dbus.WithMatchMember("PrepareForSleep"),
-  )
+  for _, target := range cfg.Targets {
+    // Convert the matchOptions map to []MatchOption
+    matchOptions := make([]dbus.MatchOption, 0, len(target.MatchOptions))
+    for key, value := range target.MatchOptions {
+      matchOptions = append(matchOptions, dbus.WithMatchOption(key, value))
+    }
+    
+    // Load dynamic library
+    dlib, err := plugin.Open(target.Dlib)
+    if err != nil {
+      log.Fatalf("Failed to load dynamic library %v for target %v: %v", target.Dlib, target.Target, err)
+    }
 
-  // Listen for Lock
-  ListenFor(
-    "lock.target",
-    false, // toggle
-    true, // start
-    false, // system
-    lockCode,
-    dbus.WithMatchInterface("org.freedesktop.login1.Session"),
-    dbus.WithMatchSender("org.freedesktop.login1"),
-    dbus.WithMatchMember("Lock"),
-  )
+    symbol, err := dlib.Lookup("Hardcode")
+    if err != nil {
+      log.Fatalf("Failed to locate symbol 'Hardcode' in dynamic library %v for target %v: %v", target.Dlib, target.Target, err)
+    }
 
-  ListenFor(
-    "unlock.target",
-    false, // toggle
-    true, // start
-    false, // system
-    lockCode,
-    dbus.WithMatchInterface("org.freedesktop.login1.Session"),
-    dbus.WithMatchSender("org.freedesktop.login1"),
-    dbus.WithMatchMember("Unlock"),
-  )
-  
+    hardcode, ok := symbol.(Hardcode)
+    if !ok {
+      log.Fatalf("Unexpected signature for symbol 'Hardcode' in dynamic library %v for target %v", target.Dlib, target.Target)
+    }
+
+    // Dispatch Listener
+    ListenFor(
+      target.Target,
+      target.Toggle,
+      target.Start,
+      target.System,
+      hardcode,
+      matchOptions...,
+    )
+  }
+
   log.Println("Initialization complete.")
 
   sent, err := daemon.SdNotify(true, daemon.SdNotifyReady)

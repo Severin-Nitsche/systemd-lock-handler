@@ -1,53 +1,31 @@
-systemd-lock-handler
+dbus-systemd-dispatcher
 ====================
-[Source](https://git.sr.ht/~whynothugo/systemd-lock-handler) |
-[Issues](https://todo.sr.ht/~whynothugo/systemd-lock-handler) |
-[Patches](https://lists.sr.ht/~whynothugo/public-inbox) |
-[Chat](irc://ircs.libera.chat:6697/#whynothugo)
+This is derivative work based on `systemd-lock-handler` by Hugo Osvaldo Barrera.
+Check out the original source
+[here](https://git.sr.ht/~whynothugo/systemd-lock-handler)
 
-[![builds.sr.ht status](https://builds.sr.ht/~whynothugo/systemd-lock-handler/commits/.build.yml.svg)](https://builds.sr.ht/~whynothugo/systemd-lock-handler/commits/.build.yml?)
+The whole thing is based on the idea that some events such as (un)locking the
+session or going into sleep are announced via the D-Bus but are not easily
+accessible to the user space.
 
-`logind` (part of systemd) emits events when the system is locked, unlocked or
-goes into sleep.
+This software provides an interface to hook systemd targets onto these events.
+It is fully configurable via yaml and provides the ability to even hook custom
+logic into the dispatcher via the loading of dynamic libraries.
 
-These events however, are simple D-Bus events, and don't actually run anything.
-There are no facilities for users to easily _run_ anything on these events
-either (e.g.: a screen locker).
-
-`systemd-lock-handler` is a small, lightweight helper fills this gap.
-
-When the system is either locked, unlocked, or about to go into sleep, this
-service will start the `lock.target`, `unlock.target` and `sleep.target`
-systemd user targets respectively.
-
-When the system is unlocked, `lock-target` will be stopped.
-
-Any service can be configured to start with any of these targets:
-
-- A screen locker.
-- A service that keeps the screen off after 15 seconds of inactivity.
-- A service that turns the volume to 0%.
-- ...
-
-Note that systemd already has a `sleep.target`, however, that's a system-level
-target, and your user-level units can't rely on it. The one included in this
-package does not conflict, but rather compliments that one.
+This allows for example the provided `sleep.target`-hook to hold on to a sleep
+inhibitor lock to ensure the execution of dependant units.
 
 Installation
 ------------
 
-## On ArchLinux
+I don't know why you would install this manually.
+When time comes, I plan however on writing a nice nix-module for this.
 
-A package is available in the AUR:
+## Manual
 
-    paru -S systemd-lock-handler
+You can (probably) manually build and install:
 
-## Other platforms
-
-You can manually build and install:
-
-    git@git.sr.ht:~whynothugo/systemd-lock-handler
-    cd systemd-lock-handler
+    cd dbus-systemd-dispatcher
     make build
     sudo make install
 
@@ -56,70 +34,86 @@ Usage
 
 The service itself must be enabled for the current user:
 
-    systemctl --user enable --now systemd-lock-handler.service
+    systemctl --user enable --now dbus-systemd-dispatcher.service
 
-Additionally, service files must be created and enabled for any service that
-should start when the system is locked.
+Additionally, target files must be available for all configured targets and the
+specified `.so` files for custom logic must be locateable.
 
-For example, `enabling` this service file would run `swaylock` when `logind`
-locks the session and before the system goes to sleep:
+Configuration
+-------------
 
-    [Unit]
-    Description=Screen locker for Wayland
-    # If swaylock exits cleanly, unlock the session:
-    OnSuccess=unlock.target
-    # When lock.target is stopped, stops this too:
-    PartOf=lock.target
-    # Delay lock.target until this service is ready:
-    After=lock.target
+The program is configured via `configuration.yaml`.
+All targets must be configured under the `targets` key as list entries with the
+following keys:
 
-    [Service]
-    # systemd will consider this service started when swaylock forks...
-    Type=forking
-    # ... and swaylock will fork only after it has locked the screen.
-    ExecStart=/usr/bin/swaylock -f
-    # If swaylock crashes, always restart it immediately:
-    Restart=on-failure
-    RestartSec=0
+|  key   |     description     |
+|--------|---------------------|
+| target | The target to start |
+| dlib   | The dynamic library for custom logic |
+| toggle | Whether to toggle the target upon repetition of the event |
+| start  | Whether to (initially) start or stop the target |
+| system | Whether to run the target as a system or user target |
+| dbus   | The D-Bus [match rules](https://dbus.freedesktop.org/doc/dbus-specification.html#message-bus-routing-match-rules) for the event |
 
-    [Install]
-    WantedBy=lock.target
+Consider this example for further reference:
 
-Specifying `PartOf=lock.target` indicates to systemd that this service should
-be stopped if `lock.target` is stopped. This is even more important for
-services that _aren't_ the screen locker, since this setting means they'll get
-stopped when the system is unlocked.
+```yaml
+# config.yaml
+targets:
+  - target: "sleep.target"
+    dlib: "bin/sleep.so"
+    toggle: true
+    start: true
+    system: false
+    dbus:
+      path: "/org/freedesktop/login1"
+      interface: "org.freedesktop.login1.Manager"
+      member: "PrepareForSleep"
+```
 
-Specifying `WantedBy=lock.target` will have this service run when locking
-**or** sleeping the system.
+Custom Logic
+------------
 
-Specifying `WantedBy=sleep.target` will have this service run only when
-sleeping the system. Note that the service will continue running after
-waking up from sleep.
+The `dlib` of a target, if provided provides flexible means of custom validation
+logic. It is realized via go [plugins](https://pkg.go.dev/plugin), so watch out
+with which version of the toolchain you compile your plugins vs. which version
+of the program you use.
 
-## Locking
+The symbol searched for in the export is `Hardcode`. The type signature should
+be:
 
-Lock your session using `loginctl lock-session`.
+```go
+func() (
+  func(),
+  func(*dbus.Conn, *dbus.Signal) bool,
+  func(),
+  func(),
+)
+```
 
-This will mark the session as locked, and start `lock.target` along with any
-services that are `WantedBy` it.
+where `dbus` refers to the [dbus
+package](https://pkg.go.dev/github.com/godbus/dbus/v5).
 
-## Unlocking
+The `Hardcode`-symbol will be called for every target that specified its
+corresponding dynamic library. The return values of `Hardcode` are coined `init,
+verify, before, after` in that order.
 
-Unlock your session using `loginctl unlock-session`.
+`init` will be executed once before the program listens to the dbus.
+`verify` will be executed everytime a matching signal arrives. The corresponding
+unit will only be executed/stopped if verify passes.
 
-This will mark the session as unlocked, start `unlock.target`, and stop
-`lock.target`. 
+Considering the `before` and `after`, they have to be explained with the
+`toggle` configuration.
 
-Service that are marked `PartOf=lock.target` will be stopped when `lock.target`
-stops.
+If `toggle` is set to `false`, that is the target is configured to always
+stop/start depending on `start`, `before` is executed everytime before waiting
+for a verified D-Bus signal but not inbetween signals that got rejected by
+`verify`. In this case `after` is never called.
 
-## Suspending
-
-Sleep your device using `systemctl suspend`.
-
-This will start `sleep.target` along with any services that are `WantedBy` it.
-This will happen _before_ the system is suspended.
+If `toggle` is set to `true`, `after` will be called instead of `before` on
+every second invocation. That is before waiting for the dbus signal that
+initiates the action opposite of the one defined via `start` and *after* the
+action defined via `start` was performed.
 
 Changelog
 ---------
