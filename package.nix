@@ -13,7 +13,7 @@ let
   ];
 in buildGoModule {
   pname = "dbus-systemd-dispatcher";
-  version = "3.0";
+  version = "3.0.0";
 
   src = fs.toSource {
     root = ./.;
